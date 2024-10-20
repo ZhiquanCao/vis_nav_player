@@ -40,8 +40,20 @@ class KeyboardPlayerPyGame(Player):
         if os.path.exists("codebook.pkl"):
             self.codebook = pickle.load(open("codebook.pkl", "rb"))
         # Initialize database for storing VLAD descriptors of FPV
-        self.database = None
+        self.database_path = "database.pkl"
+        self.load_database()
         self.goal = None
+
+    def save_database(self):
+        with open(self.database_path, 'wb') as file:
+            pickle.dump(self.database, file)
+
+    def load_database(self):
+        if os.path.exists(self.database_path):
+            with open(self.database_path, 'rb') as file:
+                self.database = pickle.load(file)
+        else:
+            self.database = None
 
     def reset(self):
         # Reset the player state
@@ -219,6 +231,17 @@ class KeyboardPlayerPyGame(Player):
         _, index = self.tree.query(q_VLAD, 1)
         return index[0][0]
 
+    def get_neighbors(self, img):
+        """
+        Find the nearest neighbor in the database based on VLAD descriptor
+        """
+        # Get the VLAD feature of the image
+        q_VLAD = self.get_VLAD(img).reshape(1, -1)
+        # This function returns the index of the closest match of the provided VLAD feature from the database the tree was created
+        # The '1' indicates the we want 7 nearest neighbor
+        distances, indices = self.tree.query(q_VLAD, 5)
+        return distances[0], indices[0]
+
     def pre_nav_compute(self):
         """
         Build BallTree for nearest neighbor search and find the goal ID
@@ -258,14 +281,14 @@ class KeyboardPlayerPyGame(Player):
                 img = cv2.imread(os.path.join(self.save_dir, img))
                 VLAD = self.get_VLAD(img)
                 self.database.append(VLAD)
-                
-            # Build a BallTree for fast nearest neighbor search
-            # We create this tree to efficiently perform nearest neighbor searches later on which will help us navigate and reach the target location
+            self.save_database()
+        # Build a BallTree for fast nearest neighbor search
+        # We create this tree to efficiently perform nearest neighbor searches later on which will help us navigate and reach the target location
             
-            # TODO: try tuning the leaf size for better performance
-            print("Building BallTree...")
-            tree = BallTree(self.database, leaf_size=64)
-            self.tree = tree        
+        # TODO: try tuning the leaf size for better performance
+        print("Building BallTree...")
+        tree = BallTree(self.database, leaf_size=64)
+        self.tree = tree        
 
 
     def pre_navigation(self):
@@ -274,7 +297,19 @@ class KeyboardPlayerPyGame(Player):
         """
         super(KeyboardPlayerPyGame, self).pre_navigation()
         self.pre_nav_compute()
+
+    def find_largest_index_below_goal(self, distances, indices):
+        # Filter indices and their corresponding distances where indices are smaller than goal
+        filtered = [(dist, idx) for dist, idx in zip(distances, indices) if idx < self.goal]
         
+        # If no such indices exist, return None
+        if not filtered:
+            return -1, -1
+        
+        # Find the element with the maximum index value
+        max_distance, max_index = max(filtered, key=lambda x: x[1])        
+        return max_distance, max_index
+
     def display_next_best_view(self):
         """
         Display the next best view based on the current first-person view
@@ -285,9 +320,16 @@ class KeyboardPlayerPyGame(Player):
 
         # Get the neighbor of current FPV
         # In other words, get the image from the database that closely matches current FPV
-        index = self.get_neighbor(self.fpv)
+        # index = self.get_neighbor(self.fpv)
+        distances, indices = self.get_neighbors(self.fpv)
+        d, index = self.find_largest_index_below_goal(distances, indices)
+        
+        if index == -1:
+            print("exceeded the goal")
+            return
         # Display the image 5 frames ahead of the neighbor, so that next best view is not exactly same as current FPV
-        self.display_img_from_id(index+3, f'Next Best View')
+        # self.display_img_from_id(index+3, f'Next Best View')
+        self.display_img_from_id(index+3, f'Modified Next Best View')
         # Display the next best view id along with the goal id to understand how close/far we are from the goal
         print(f'Next View ID: {index+3} || Goal ID: {self.goal}')
 
