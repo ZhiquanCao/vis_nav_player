@@ -10,6 +10,8 @@ from sklearn.cluster import KMeans
 from sklearn.neighbors import BallTree
 from tqdm import tqdm
 from natsort import natsorted
+from sklearn.cluster import MiniBatchKMeans
+import math
 
 import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
@@ -32,15 +34,18 @@ class KeyboardPlayerPyGame(Player):
 
         # Initialize SIFT detector
         # SIFT stands for Scale-Invariant Feature Transform
-        self.sift = cv2.SIFT_create()
+        self.sift = cv2.SIFT_create(nfeatures=100)
         # Load pre-trained sift features and codebook
         self.sift_descriptors, self.codebook = None, None
+        self.database = None
         if os.path.exists("sift_descriptors.npy"):
+            print("Sift descriptors is located at ", os.path.abspath("sift_descriptors.npy"))
             self.sift_descriptors = np.load("sift_descriptors.npy")
         if os.path.exists("codebook.pkl"):
             self.codebook = pickle.load(open("codebook.pkl", "rb"))
+        if os.path.exists("database.pkl"):
+            self.database = pickle.load(open("database.pkl", "rb"))
         # Initialize database for storing VLAD descriptors of FPV
-        self.database = None
         self.goal = None
 
     def reset(self):
@@ -139,7 +144,8 @@ class KeyboardPlayerPyGame(Player):
         """
         Display image from database based on its ID using OpenCV
         """
-        path = self.save_dir + str(id) + ".jpg"
+        path = self.save_dir + "image_" + str(id) + ".png"
+        print(f"Displaying image from path: {path}")
         if os.path.exists(path):
             img = cv2.imread(path)
             cv2.imshow(window_name, img)
@@ -151,7 +157,7 @@ class KeyboardPlayerPyGame(Player):
         """
         Compute SIFT features for images in the data directory
         """
-        files = natsorted([x for x in os.listdir(self.save_dir) if x.endswith('.jpg')])
+        files = natsorted([x for x in os.listdir(self.save_dir) if x.endswith('.png')])
         sift_descriptors = list()
         for img in tqdm(files, desc="Processing images"):
             img = cv2.imread(os.path.join(self.save_dir, img))
@@ -244,7 +250,10 @@ class KeyboardPlayerPyGame(Player):
         # TODO: try tuning the function parameters for better performance
         if self.codebook is None:
             print("Computing codebook...")
-            self.codebook = KMeans(n_clusters=128, init='k-means++', n_init=5, verbose=1).fit(self.sift_descriptors)
+            # self.codebook = KMeans(n_clusters=128, init='k-means++', n_init=5, verbose=1).fit(self.sift_descriptors)
+            self.codebook = MiniBatchKMeans(
+                                n_clusters=128, batch_size=500, max_iter=200, n_init=5, verbose=1
+                            ).fit(self.sift_descriptors)
             pickle.dump(self.codebook, open("codebook.pkl", "wb"))
         else:
             print("Loaded codebook from codebook.pkl")
@@ -253,19 +262,21 @@ class KeyboardPlayerPyGame(Player):
         if self.database is None:
             self.database = []
             print("Computing VLAD embeddings...")
-            exploration_observation = natsorted([x for x in os.listdir(self.save_dir) if x.endswith('.jpg')])
+            exploration_observation = natsorted([x for x in os.listdir(self.save_dir) if x.endswith('.png')])
             for img in tqdm(exploration_observation, desc="Processing images"):
                 img = cv2.imread(os.path.join(self.save_dir, img))
                 VLAD = self.get_VLAD(img)
                 self.database.append(VLAD)
-                
-            # Build a BallTree for fast nearest neighbor search
-            # We create this tree to efficiently perform nearest neighbor searches later on which will help us navigate and reach the target location
+
+            pickle.dump(self.database, open("database.pkl", "wb"))
             
-            # TODO: try tuning the leaf size for better performance
-            print("Building BallTree...")
-            tree = BallTree(self.database, leaf_size=64)
-            self.tree = tree        
+        # Build a BallTree for fast nearest neighbor search
+        # We create this tree to efficiently perform nearest neighbor searches later on which will help us navigate and reach the target location
+        # TODO: try tuning the leaf size for better performance
+        print("Building BallTree...")
+        print("Length of database: ", len(self.database)) 
+        tree = BallTree(self.database, leaf_size=64)
+        self.tree = tree        
 
 
     def pre_navigation(self):
@@ -274,7 +285,74 @@ class KeyboardPlayerPyGame(Player):
         """
         super(KeyboardPlayerPyGame, self).pre_navigation()
         self.pre_nav_compute()
+    
+    def display_images_from_indices(self, indices, window_name="Dynamic Image Grid"):
+        """
+        Display images in a dynamic grid based on the number of indices.
+        The grid is arranged with the best-fit row and column sizes.
+        """
+        images = []
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.5
+        font_thickness = 1
+        text_color = (255, 255, 255)  # White
+        text_bg_color = (0, 0, 0)  # Black
+
+        # Load and annotate images
+        for idx in indices:
+            path = self.save_dir + "image_" + str(idx) + ".png"
+            if os.path.exists(path):
+                img = cv2.imread(path)
+
+                # Resize all images to a uniform size, e.g., 256x256
+                img = cv2.resize(img, (256, 256))
+
+                # Add ID text to the image
+                text = f"ID: {idx}"
+                text_size = cv2.getTextSize(text, font, font_scale, font_thickness)[0]
+                text_x = 10
+                text_y = 20
+
+                # Draw background for text
+                cv2.rectangle(img, (text_x, text_y - 15), (text_x + text_size[0] + 5, text_y + 5), text_bg_color, -1)
+
+                # Add text overlay
+                cv2.putText(img, text, (text_x, text_y), font, font_scale, text_color, font_thickness, cv2.LINE_AA)
+
+                images.append(img)
+            else:
+                print(f"Image with ID {idx} does not exist")
+
+        # Compute grid size
+        num_images = len(images)
+        cols = math.ceil(math.sqrt(num_images))  # Number of columns
+        rows = math.ceil(num_images / cols)     # Number of rows
+
+        # Fill the grid with blank images if necessary
+        blank_image = np.zeros((256, 256, 3), dtype=np.uint8)
+        while len(images) < rows * cols:
+            images.append(blank_image)
+
+        # Create the grid
+        grid_rows = []
+        for r in range(rows):
+            start_idx = r * cols
+            end_idx = start_idx + cols
+            row = cv2.hconcat(images[start_idx:end_idx])
+            grid_rows.append(row)
+
+        grid = cv2.vconcat(grid_rows)
+
+        # Display the final grid
+        cv2.imshow(window_name, grid)
+        cv2.waitKey(1)
+
+    def display_topk_matched_images(self):
+        q_VLAD = self.get_VLAD(self.fpv).reshape(1, -1)
+        _, indices = self.tree.query(q_VLAD, 6)
+        self.display_images_from_indices(indices[0], window_name="Top 6 Matched Images")
         
+            
     def display_next_best_view(self):
         """
         Display the next best view based on the current first-person view
@@ -348,6 +426,9 @@ class KeyboardPlayerPyGame(Player):
                 # If 'q' key is pressed, then display the next best view based on the current FPV
                 if keys[pygame.K_q]:
                     self.display_next_best_view()
+                
+                if keys[pygame.K_f]:
+                    self.display_topk_matched_images()
 
         # Display the first-person view image on the pygame screen
         rgb = convert_opencv_img_to_pygame(fpv)
