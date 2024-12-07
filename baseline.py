@@ -1,5 +1,6 @@
 # import necessary libraries and modules
 from vis_nav_game import Player, Action, Phase
+from trajectory_map import TrajectoryMap
 import pygame
 import cv2
 
@@ -47,6 +48,8 @@ class KeyboardPlayerPyGame(Player):
             self.database = pickle.load(open("database.pkl", "rb"))
         # Initialize database for storing VLAD descriptors of FPV
         self.goal = None
+
+        self.trajectory_map = TrajectoryMap()
 
     def reset(self):
         # Reset the player state
@@ -359,7 +362,7 @@ class KeyboardPlayerPyGame(Player):
         """
 
         # TODO: could you write this function in a smarter way to not simply display the image that closely 
-        # matches the current FPV but the image that can efficiently help you reach the target?
+        # matches the current FPV but the image tha can efficiently help you reach the target?
 
         # Get the neighbor of current FPV
         # In other words, get the image from the database that closely matches current FPV
@@ -368,6 +371,9 @@ class KeyboardPlayerPyGame(Player):
         self.display_img_from_id(index+3, f'Next Best View')
         # Display the next best view id along with the goal id to understand how close/far we are from the goal
         print(f'Next View ID: {index+3} || Goal ID: {self.goal}')
+
+        # Show the next best view on the trajectory map
+        self.trajectory_map.show_dot(index+3)
 
     def see(self, fpv):
         """
@@ -420,6 +426,9 @@ class KeyboardPlayerPyGame(Player):
                     index = self.get_neighbor(targets[0])
                     self.goal = index
                     print(f'Goal ID: {self.goal}')
+
+                    # Show the target image on the trajectory map
+                    self.trajectory_map.show_target(self.goal)
                                 
                 # Key the state of the keys
                 keys = pygame.key.get_pressed()
