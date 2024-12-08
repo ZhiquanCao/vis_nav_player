@@ -36,6 +36,7 @@ class KeyboardPlayerPyGame(Player):
         # Initialize SIFT detector
         # SIFT stands for Scale-Invariant Feature Transform
         self.sift = cv2.SIFT_create(nfeatures=100)
+        self.bf = cv2.BFMatcher()
         # Load pre-trained sift features and codebook
         self.sift_descriptors, self.codebook = None, None
         self.database = None
@@ -48,6 +49,7 @@ class KeyboardPlayerPyGame(Player):
             self.database = pickle.load(open("database.pkl", "rb"))
         # Initialize database for storing VLAD descriptors of FPV
         self.goal = None
+        self.targets = None
 
         self.trajectory_map = TrajectoryMap()
 
@@ -279,7 +281,7 @@ class KeyboardPlayerPyGame(Player):
         print("Building BallTree...")
         print("Length of database: ", len(self.database)) 
         tree = BallTree(self.database, leaf_size=64)
-        self.tree = tree        
+        self.tree = tree
 
 
     def pre_navigation(self):
@@ -289,7 +291,7 @@ class KeyboardPlayerPyGame(Player):
         super(KeyboardPlayerPyGame, self).pre_navigation()
         self.pre_nav_compute()
     
-    def display_images_from_indices(self, indices, window_name="Dynamic Image Grid"):
+    def display_images_from_indices(self, indices, offset=3, window_name="Dynamic Image Grid"):
         """
         Display images in a dynamic grid based on the number of indices.
         The grid is arranged with the best-fit row and column sizes.
@@ -303,6 +305,8 @@ class KeyboardPlayerPyGame(Player):
 
         # Load and annotate images
         for idx in indices:
+            # Choose the image based on the offset
+            idx += offset
             path = self.save_dir + "image_" + str(idx) + ".png"
             if os.path.exists(path):
                 img = cv2.imread(path)
@@ -350,13 +354,44 @@ class KeyboardPlayerPyGame(Player):
         cv2.imshow(window_name, grid)
         cv2.waitKey(1)
 
-    def display_topk_matched_images(self):
-        q_VLAD = self.get_VLAD(self.fpv).reshape(1, -1)
-        _, indices = self.tree.query(q_VLAD, 6)
-        self.display_images_from_indices(indices[0], window_name="Top 6 Matched Images")
+    def display_topk_matched_images(self, img, offset=3, k=6):
+        q_VLAD = self.get_VLAD(img).reshape(1, -1)
+        _, indices = self.tree.query(q_VLAD, k)
+        self.display_images_from_indices(indices[0], offset=offset)
         
-            
-    def display_next_best_view(self):
+    def verified_score(self, img1_des, img2_des):
+        """
+        Compute the verified score between two images
+        """
+
+        matches = self.bf.knnMatch(img1_des, img2_des, k=2)
+        good_matches = []
+        for m, n in matches:
+            if m.distance < 0.75 * n.distance:
+                good_matches.append([m])
+        return len(good_matches)
+
+    def get_best_neighbor(self, img):
+        """
+        Find the best neighbor in the database based on VLAD descriptor
+        """
+        # Get the VLAD feature of the image
+        q_VLAD = self.get_VLAD(img).reshape(1, -1)
+        _, des = self.sift.detectAndCompute(img, None)
+        # This function returns the index of the closest match of the provided VLAD feature from the database the tree was created
+        # The '1' indicates the we want 1 nearest neighbor
+        _, indices = self.tree.query(q_VLAD, 6)
+        max_score = 0
+        best_neighbor = None
+        for idx in indices[0]:
+            _, curr_des = self.sift.detectAndCompute(cv2.imread(self.save_dir + "image_" + str(idx) + ".png"), None)
+            curr_score = self.verified_score(des, curr_des)
+            if curr_score > max_score:
+                best_neighbor = idx
+                max_score = curr_score
+        return best_neighbor
+
+    def display_next_best_view(self, offset=3):
         """
         Display the next best view based on the current first-person view
         """
@@ -366,11 +401,12 @@ class KeyboardPlayerPyGame(Player):
 
         # Get the neighbor of current FPV
         # In other words, get the image from the database that closely matches current FPV
-        index = self.get_neighbor(self.fpv)
+        # index = self.get_neighbor(self.fpv)
+        index = self.get_best_neighbor(self.fpv)
         # Display the image 5 frames ahead of the neighbor, so that next best view is not exactly same as current FPV
-        self.display_img_from_id(index+3, f'Next Best View')
+        self.display_img_from_id(index+offset, f'Next Best View')
         # Display the next best view id along with the goal id to understand how close/far we are from the goal
-        print(f'Next View ID: {index+3} || Goal ID: {self.goal}')
+        print(f'Next View ID: {index+offset} || Goal ID: {self.goal}')
 
         # Show the next best view on the trajectory map
         self.trajectory_map.show_dot(index+3)
@@ -422,8 +458,9 @@ class KeyboardPlayerPyGame(Player):
                 
                 if self.goal is None:
                     # Get the neighbor nearest to the front view of the target image and set it as goal
-                    targets = self.get_target_images()
-                    index = self.get_neighbor(targets[0])
+                    self.targets = self.get_target_images()
+                    index = self.get_best_neighbor(self.targets[0])
+                    # index = self.get_neighbor(self.targets[0])
                     self.goal = index
                     print(f'Goal ID: {self.goal}')
 
@@ -437,7 +474,11 @@ class KeyboardPlayerPyGame(Player):
                     self.display_next_best_view()
                 
                 if keys[pygame.K_f]:
-                    self.display_topk_matched_images()
+                    self.display_topk_matched_images(self.fpv)
+                
+                if keys[pygame.K_t]:
+                    self.display_img_from_id(self.get_best_neighbor(self.targets[0])-3, "Target Image")
+                    self.display_topk_matched_images(self.targets[0], offset=-3)
 
         # Display the first-person view image on the pygame screen
         rgb = convert_opencv_img_to_pygame(fpv)
