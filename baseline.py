@@ -13,6 +13,7 @@ from tqdm import tqdm
 from natsort import natsorted
 from sklearn.cluster import MiniBatchKMeans
 import math
+import faiss
 
 import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
@@ -29,7 +30,7 @@ class KeyboardPlayerPyGame(Player):
         super(KeyboardPlayerPyGame, self).__init__()
         
         # Variables for reading exploration data
-        self.save_dir = "data/images_subsample/"
+        self.save_dir = "data/images1/"
         if not os.path.exists(self.save_dir):
             print(f"Directory {self.save_dir} does not exist, please download exploration data.")
 
@@ -42,16 +43,19 @@ class KeyboardPlayerPyGame(Player):
         self.database = None
         if os.path.exists("sift_descriptors.npy"):
             print("Sift descriptors is located at ", os.path.abspath("sift_descriptors.npy"))
-            self.sift_descriptors = np.load("sift_descriptors.npy")
+            self.sift_descriptors = np.load("sift_descriptors.npy").astype(np.float32)
         if os.path.exists("codebook.pkl"):
             self.codebook = pickle.load(open("codebook.pkl", "rb"))
         if os.path.exists("database.pkl"):
             self.database = pickle.load(open("database.pkl", "rb"))
+        if os.path.exists("database.npy"):
+            self.database = np.load("database.npy").astype(np.float32)
         # Initialize database for storing VLAD descriptors of FPV
         self.goal = None
         self.targets = None
 
         self.trajectory_map = TrajectoryMap()
+        self.faiss_index = None
 
     def reset(self):
         # Reset the player state
@@ -164,14 +168,20 @@ class KeyboardPlayerPyGame(Player):
         """
         files = natsorted([x for x in os.listdir(self.save_dir) if x.endswith('.png')])
         sift_descriptors = list()
-        for img in tqdm(files, desc="Processing images"):
+        for i, img in enumerate(tqdm(files, desc="Processing images")):
+            # if i < 1480: continue
             img = cv2.imread(os.path.join(self.save_dir, img))
             # Pass the image to sift detector and get keypoints + descriptions
             # We only need the descriptors
             # These descriptors represent local features extracted from the image.
             _, des = self.sift.detectAndCompute(img, None)
+            if des is None or len(des) == 0: 
+                print(f"Image {img} at {i} has no descriptors")
+
+                # raise ValueError(f"Image {img} at {i} has no descriptors")
+                continue
             # Extend the sift_descriptors list with descriptors of the current image
-            sift_descriptors.extend(des)
+            sift_descriptors.extend(des.astype(np.float32))
         return np.asarray(sift_descriptors)
     
     def get_VLAD(self, img):
@@ -190,12 +200,14 @@ class KeyboardPlayerPyGame(Player):
         _, des = self.sift.detectAndCompute(img, None)
         # We then predict the cluster labels using the pre-trained codebook
         # Each descriptor is assigned to a cluster, and the predicted cluster label is returned
+        if des is None or len(des) == 0:
+            return np.zeros(self.codebook.n_clusters * 128, dtype=np.float32)
         pred_labels = self.codebook.predict(des)
         # Get number of clusters that each descriptor belongs to
-        centroids = self.codebook.cluster_centers_
+        centroids = self.codebook.cluster_centers_.astype(np.float32)
         # Get the number of clusters from the codebook
         k = self.codebook.n_clusters
-        VLAD_feature = np.zeros([k, des.shape[1]])
+        VLAD_feature = np.zeros([k, des.shape[1]], dtype=np.float32)
 
         # Loop over the clusters
         for i in range(k):
@@ -238,7 +250,7 @@ class KeyboardPlayerPyGame(Player):
         if self.sift_descriptors is None:
             print("Computing SIFT features...")
             self.sift_descriptors = self.compute_sift_features()
-            np.save("sift_descriptors.npy", self.sift_descriptors)
+            np.save("sift_descriptors.npy", np.array(self.sift_descriptors, dtype=np.float32))
         else:
             print("Loaded SIFT features from sift_descriptors.npy")
 
@@ -257,8 +269,8 @@ class KeyboardPlayerPyGame(Player):
             print("Computing codebook...")
             # self.codebook = KMeans(n_clusters=128, init='k-means++', n_init=5, verbose=1).fit(self.sift_descriptors)
             self.codebook = MiniBatchKMeans(
-                                n_clusters=128, batch_size=500, max_iter=200, n_init=5, verbose=1
-                            ).fit(self.sift_descriptors)
+                                n_clusters=64, batch_size=500, max_iter=200, n_init=5, verbose=1
+                            ).fit(self.sift_descriptors.astype(np.float32))
             pickle.dump(self.codebook, open("codebook.pkl", "wb"))
         else:
             print("Loaded codebook from codebook.pkl")
@@ -273,15 +285,22 @@ class KeyboardPlayerPyGame(Player):
                 VLAD = self.get_VLAD(img)
                 self.database.append(VLAD)
 
-            pickle.dump(self.database, open("database.pkl", "wb"))
+            # pickle.dump(self.database, open("database.pkl", "wb"))
+            np.save("database.npy", np.array(self.database, dtype=np.float32))
             
         # Build a BallTree for fast nearest neighbor search
         # We create this tree to efficiently perform nearest neighbor searches later on which will help us navigate and reach the target location
         # TODO: try tuning the leaf size for better performance
-        print("Building BallTree...")
-        print("Length of database: ", len(self.database)) 
-        tree = BallTree(self.database, leaf_size=64)
-        self.tree = tree
+        # print("Building BallTree...")
+        # print("Length of database: ", len(self.database)) 
+        # tree = BallTree(self.database, leaf_size=64)
+        
+        # self.tree = tree
+        self.database = np.load("database.npy").astype(np.float32)
+        self.faiss_index = faiss.IndexFlatL2(self.database.shape[1])
+        faiss.normalize_L2(self.database)
+        self.faiss_index.add(self.database)
+        print(f"FAISS index built with {self.faiss_index.ntotal} vectors.")
 
 
     def pre_navigation(self):
@@ -355,15 +374,24 @@ class KeyboardPlayerPyGame(Player):
         cv2.waitKey(1)
 
     def display_topk_matched_images(self, img, offset=3, k=6):
-        q_VLAD = self.get_VLAD(img).reshape(1, -1)
-        _, indices = self.tree.query(q_VLAD, k)
+        q_VLAD = self.get_VLAD(img).reshape(1, -1).astype(np.float32)
+        faiss.normalize_L2(q_VLAD)
+        # _, indices = self.tree.query(q_VLAD, k)
+        _, indices = self.faiss_index.search(q_VLAD, k)
         self.display_images_from_indices(indices[0], offset=offset)
         
     def verified_score(self, img1_des, img2_des):
         """
         Compute the verified score between two images
         """
-
+        if img1_des is None:
+            print("The img1 is None")
+            return 0
+        if img2_des is None:
+            print("One of the descriptors is None.")
+            return 0
+        img1_des = img1_des.astype(np.float32)
+        img2_des = img2_des.astype(np.float32)
         matches = self.bf.knnMatch(img1_des, img2_des, k=2)
         good_matches = []
         for m, n in matches:
@@ -376,15 +404,24 @@ class KeyboardPlayerPyGame(Player):
         Find the best neighbor in the database based on VLAD descriptor
         """
         # Get the VLAD feature of the image
-        q_VLAD = self.get_VLAD(img).reshape(1, -1)
+        q_VLAD = self.get_VLAD(img).reshape(1, -1).astype(np.float32)
         _, des = self.sift.detectAndCompute(img, None)
         # This function returns the index of the closest match of the provided VLAD feature from the database the tree was created
         # The '1' indicates the we want 1 nearest neighbor
-        _, indices = self.tree.query(q_VLAD, 6)
+        # _, indices = self.tree.query(q_VLAD, 6)
+        _, indices = self.faiss_index.search(q_VLAD, 6)
         max_score = 0
         best_neighbor = None
         for idx in indices[0]:
-            _, curr_des = self.sift.detectAndCompute(cv2.imread(self.save_dir + "image_" + str(idx) + ".png"), None)
+            image_path = os.path.join(self.save_dir, f"image_{str(idx)}.png")
+            print(f"Attempting to load image from: {image_path}")  # Debugging line
+            
+            # Check if the image exists
+            if not os.path.exists(image_path):
+                print(f"Image with ID {idx} does not exist at path: {image_path}")
+                
+
+            _, curr_des = self.sift.detectAndCompute(cv2.imread(image_path), None)
             curr_score = self.verified_score(des, curr_des)
             if curr_score > max_score:
                 best_neighbor = idx
@@ -409,7 +446,7 @@ class KeyboardPlayerPyGame(Player):
         print(f'Next View ID: {index+offset} || Goal ID: {self.goal}')
 
         # Show the next best view on the trajectory map
-        self.trajectory_map.show_dot(index+3)
+        # self.trajectory_map.show_dot(index+3)s
 
     def see(self, fpv):
         """
@@ -465,7 +502,7 @@ class KeyboardPlayerPyGame(Player):
                     print(f'Goal ID: {self.goal}')
 
                     # Show the target image on the trajectory map
-                    self.trajectory_map.show_target(self.goal)
+                    # self.trajectory_map.show_target(self.goal)
                                 
                 # Key the state of the keys
                 keys = pygame.key.get_pressed()
